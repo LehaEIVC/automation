@@ -13,29 +13,33 @@
 # Запустить на сервере:
 #    curl -sk https://git.local/leha/playbooks/-/raw/main/automation/user/install-mpuser.sh?ref_type=heads | sudo bash
 
-set -e
-
 _USER="mpuser"
 _AUTHORIZED_KEY="ssh-rsa AAAA"
 _ARCHIVE="sudo_wrappers_static.tar"
 _TARGET_DIR="/home/$_USER"
 
+set -euo pipefail
+
 main() {
     export LANG="C"
-    export LC_ALL="C"
-    _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    export LC_ALL=C
+    #_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
     if [[ $EUID -eq 0 ]]; then
-        echo "Запускать от root запрещен!"
+       echo "Запускать от root запрещен!"
         exit 1
     fi
 
     # Проверить ключ в гите
-    _AUTHORIZED_KEY_GIT="$(curl -kqm 3 https://git.local/leha/playbooks/-/raw/main/automation/user/authorized_key?ref_type=heads 2>/dev/null)" && _AUTHORIZED_KEY="${_AUTHORIZED_KEY_GIT}"
+    _AUTHORIZED_KEY_GIT="$(curl -kqm 3 https://git.local/leha/playbooks/-/raw/main/automation/user/AUTHORIZED_KEY?ref_type=heads 2>/dev/null)" && _AUTHORIZED_KEY="${_AUTHORIZED_KEY_GIT}"
 
+    if [ -z "$_AUTHORIZED_KEY" ]; then
+        _error "SSH ключ не получен (пустое значение)"
+        exit 10
+    fi
     if [ -n "$_AUTHORIZED_KEY" ] && ! echo "$_AUTHORIZED_KEY" | ssh-keygen -l -f - &>/dev/null; then
         _error "Невалидный SSH ключ: ${_AUTHORIZED_KEY}"
-        #exit 10
+        #exit 15
     fi
 
     # Определить ID операционной системы
@@ -57,51 +61,27 @@ main() {
 
     # Проверить существование архива
     if [ ! -f "${_ARCHIVE}" ]; then
-        _error "Архив не найден: ${_ARCHIVE}"
-        exit 30
+        curl -kqm 3 https://git.local/leha/playbooks/-/raw/main/automation/user/sudo_wrappers_static.tar -o ./sudo_wrappers_static.tar || {
+            _error "Архив не найден: ${_ARCHIVE}"
+            exit 30
+        }
     fi
 
-    # Проверяем, есть ли такая директория в архиве
-    # (превращаем 'ubuntu' в 'ubuntu/' для корректного поиска пути)
-    if ! tar -tf "$_ARCHIVE" | grep -q "sudo_wrappers_static/${OS_ID}/"; then
-        _log "Директория '${OS_ID}' не найдена в архиве."
+    [ "$(tar -tf "$_ARCHIVE" | grep -E "sudo_wrappers_static/${OS_ID}/bin/$|sudo_wrappers_static/${OS_ID}/mpuser$|sudo_wrappers_static/${OS_ID}/.bash_profile$" | wc -l)" -ne 3 ] && {
+        _log "В архиве отсутствует один из файлов (mpuser, .bash_profile) или директория bin"
         exit 40
-    fi
-
-    if ! tar -tf "$_ARCHIVE" | grep -q "sudo_wrappers_static/${OS_ID}/mpuser$"; then
-        _error "Файл 'mpuser' для '${OS_ID}' отсутствует в архиве"
-        exit 50
-    fi
-
-    if ! tar -tf "$_ARCHIVE" | grep -q "sudo_wrappers_static/${OS_ID}/.bash_profile$"; then
-        _error "Файл '.bash_profile' для '${OS_ID}' отсутствует в архиве"
-        exit 60
-    fi
+    }
 
     if ! command -v visudo &> /dev/null; then
        _error "Утилита 'visudo' не найдена. Для работы скрипта необходимо установить 'visudo'!"
-       exit 70
-    fi
-
-    # Извлечь из архива файл sudoers mpuser, для проверки его корректности, если "битый" - не начинать процесс создания или обновления пользователя
-    _TMP_SUDOERS=$(mktemp /tmp/mpuser_sudoers.XXX)
-    trap 'rm -f "$_TMP_SUDOERS" 2>/dev/null' EXIT INT TERM
-    # Извлекаем файл из архива во временное расположение
-    if ! tar -xf "${_ARCHIVE}" -O "sudo_wrappers_static/${OS_ID}/mpuser" > "${_TMP_SUDOERS}" 2>/dev/null; then
-        _error "Не удалось извлечь файл 'mpuser' из архива для проверки"
-        exit 80
-    fi
-    # Проверяем синтаксис через visudo
-    if ! sudo visudo -cf "${_TMP_SUDOERS}" &>/dev/null; then
-        _error "Файл 'mpuser' в архиве содержит ошибки синтаксиса sudoers!"
-        _error "Детали: $(sudo visudo -cf "${_TMP_SUDOERS}" 2>&1 || true)"
-        exit 81
+       exit 50
     fi
 
     # Проверка дубликатов в sudoers (исключая личный файл юзера)
-    if grep -rE "^[[:space:]]*${_USER}[[:space:]]*" /etc/sudoers /etc/sudoers.d/ | grep -v /etc/sudoers.d/"${_USER}:" 2>/dev/null; then
+    if sudo grep -rE "^[[:space:]]*${_USER}[[:space:]]*" /etc/sudoers /etc/sudoers.d/ | \
+                 grep -v "/etc/sudoers.d/${_USER}:" | grep -q .; then
         _error "Пользователь '${_USER}' найден в сторонних конфигах sudoers. Проверьте вручную!"
-        exit 90
+        exit 60
     fi
 
     #############################
@@ -115,11 +95,11 @@ main() {
 
     # Проверить хеш пароля на присутствие '*'
     if [[ "$(sudo getent shadow "$_USER" | cut -d: -f2)" == *"*"* ]]; then
-        _log "Пользователь ${_USER} уже заблокирован (обнаружена '*' в хеше пароля)"
+        _log "Пользователь ${_USER} уже заблокирован (в хеше пароля есть '*')"
     else
-        # Заблокировать пользователя по паролю (включая запрет разблокировки командами: 'passwd -l ...' и 'chmod -U ...')
+        # Заблокировать пользователя по паролю (исключая возможность разблокировки командами: 'passwd -l ...' и 'chmod -U ...')
         sudo usermod -p '*' "$_USER"
-        _log "Заблокирован пользователь ${_USER} (в хеше нет '*')"
+        _log "Заблокирован пароль пользователя ${_USER} (в хеше пароля не было '*')"
     fi
 
     # Применить политику для УЗ, только если не соответствет требования ПТК ЕИВЦ
@@ -132,16 +112,16 @@ main() {
     else
         _log "Политика chage корректна - изменений не требуется"
     fi
-
     # SSH ключи - обновляем только при несовпадении
     sudo mkdir -p "${_TARGET_DIR}/.ssh"
     # Получить отпечаток (fingerprints) ключа из скрипта
-    _NEW_KEY_FP=$(echo "${_AUTHORIZED_KEY}" | ssh-keygen -l -f - 2>/dev/null | awk '{print $2}')
+    _NEW_KEY_FP=$(echo "${_AUTHORIZED_KEY}" | ssh-keygen -l -f - | awk '{print $2}')
     _EXISTING_KEY_FP=""
     # Получить отпечаток (fingerprints) ключа из файла 'authorized_keys', если файл существует
-    if [ -f "${_TARGET_DIR}/.ssh/authorized_keys" ]; then
-        _EXISTING_KEY_FP=$(ssh-keygen -l -f "${_TARGET_DIR}/.ssh/authorized_keys" 2>/dev/null | awk '{print $2}')
+    if sudo test -f "${_TARGET_DIR}/.ssh/authorized_keys"; then
+        _EXISTING_KEY_FP=$(sudo ssh-keygen -l -f "${_TARGET_DIR}/.ssh/authorized_keys" 2>/dev/null | awk '{print $2}')
     fi
+
     # Обновить ключ, если отпечатки SSH-ключей разные
     if [ "${_NEW_KEY_FP}" != "${_EXISTING_KEY_FP}" ] || [ -z "${_EXISTING_KEY_FP}" ]; then
         _log "Обновляем SSH ключи для пользователя $_USER"
@@ -152,23 +132,34 @@ main() {
         _log "SSH ключ актуальный (fingerprint: ${_NEW_KEY_FP})"
     fi
 
-    _log "Распаковка архива в $_TARGET_DIR..."
-    # Распаковывать только изменененные файлы
-    __ARCHIVE_CHECKSUM=$(tar -cf - -C "${_SCRIPT_DIR}" "sudo_wrappers_static/${OS_ID}/" 2>/dev/null | md5sum | cut -d' ' -f1)
-    # Контрольная сумма для файлов в архиве
-    _CHECKSUM_FILE="${_TARGET_DIR}/.mpuser_archive_checksum"
-    if [ ! -f "$_CHECKSUM_FILE" ] || [ "$(cat $_CHECKSUM_FILE)" != "$__ARCHIVE_CHECKSUM" ]; then
-        _log "Новый пользователь, либо изменился архив или файлы у пользователя. Разархивировать с заменой"
-        # Удалить файлы и директорию bin
-        [ -d "${_TARGET_DIR}/bin" ] && sudo rm -rf "${_TARGET_DIR}/bin"
-        [ -f "${_TARGET_DIR}/mpuser" ] && sudo rm -f "${_TARGET_DIR}/mpuser" 
-        [ -f "${_TARGET_DIR}/.bash_profile" ] && sudo rm -f "${_TARGET_DIR}/.bash_profile" 
-        # Распаковать файлы из архива
+    _log "Проверка контрольных сумм файлов..."
+    # Вычисляем хеш файлов в архиве
+    _ARCHIVE_CHECKSUM=$(tar -tf "$_ARCHIVE" | grep "sudo_wrappers_static/${OS_ID}/" | grep -v '/$' | sort | \
+                            xargs -I{} tar -xf "$_ARCHIVE" -O {} 2>/dev/null | md5sum | cut -d' ' -f1)
+    # Вычисляем хеш файлов в директории ${_USER}
+    _TARGET_CHECKSUM=$(
+        (
+            # Файлы в bin (сортируем по имени)
+            if sudo test -d "${_TARGET_DIR}/bin"; then
+                sudo find "${_TARGET_DIR}/bin" -maxdepth 1 -type f -exec basename {} \; | sort | while read -r file; do
+                    sudo cat "${_TARGET_DIR}/bin/${file}" 2>/dev/null
+                done
+            fi
+            # Файлы mpuser и .bash_profile
+            sudo test -f "${_TARGET_DIR}/mpuser" && sudo cat "${_TARGET_DIR}/mpuser" 2>/dev/null
+            sudo test -f "${_TARGET_DIR}/.bash_profile" && sudo cat "${_TARGET_DIR}/.bash_profile" 2>/dev/null
+        ) | md5sum | cut -d' ' -f1
+    )
+
+    _log "Хеши файлов в директории ${_USER} и в архиве"
+    _log "${_TARGET_CHECKSUM} ? ${_ARCHIVE_CHECKSUM}"    
+    # Сравниваем хеши
+    if [ "$_TARGET_CHECKSUM" != "$_ARCHIVE_CHECKSUM" ]; then
+        _log "Обнаружены изменения, обновляем файлы из архива..."
+        sudo rm -rf "${_TARGET_DIR}/bin" "${_TARGET_DIR}/mpuser" "${_TARGET_DIR}/.bash_profile"
         sudo tar -xf "$_ARCHIVE" -C "$_TARGET_DIR" --strip-components=2 "sudo_wrappers_static/${OS_ID}/"
-        # Сохранить контрольную сумму для проверок при повторном запуске скрипта
-        echo "$__ARCHIVE_CHECKSUM" | sudo tee "$_CHECKSUM_FILE" > /dev/null
     else
-        _log "Содержимое архива актуально, разархивирование не требуется"
+        _log "Все файлы актуальны"
     fi
 
     # Установить права
@@ -180,10 +171,10 @@ main() {
     # Проверка и обновление sudoers файла через хеш
     # Проверяли файл из архива вначале скрипта, но проверим еще раз!
     SUDOERS_FILE="/etc/sudoers.d/${_USER}"
-    if sudo visudo -cf "${_TARGET_DIR}/mpuser"; then
+    if sudo visudo -cf "${_TARGET_DIR}/mpuser" &> /dev/null; then
         # Получаем хеши (если файл существует)
         NEW_HASH=$(sudo md5sum "${_TARGET_DIR}/mpuser" | cut -d' ' -f1)
-        CURRENT_HASH=$([ -f "$SUDOERS_FILE" ] && sudo md5sum "$SUDOERS_FILE" | cut -d' ' -f1 || echo "none")
+        CURRENT_HASH=$(sudo test -e "${SUDOERS_FILE}" && sudo md5sum "${SUDOERS_FILE}" | cut -d' ' -f1 || echo "none")
         if [ "${NEW_HASH}" != "${CURRENT_HASH}" ]; then
             _log "Обновляем sudoers (хеш: ${CURRENT_HASH} -> ${NEW_HASH})"
             sudo cp "${_TARGET_DIR}/mpuser" "${SUDOERS_FILE}"
@@ -193,7 +184,7 @@ main() {
         fix_permissions_if_needed "${SUDOERS_FILE}" "root:root" "440"
     else
         _log "Ошибка: Некорректный синтаксис sudoers!"
-        exit 100
+        exit 110
     fi
 
     # Astra Linux / PDP
@@ -202,8 +193,9 @@ main() {
         sudo su "${_USER}" -c pdp-id
     fi
 
-    _log "Список inode для проверки изменялись ли файлы скриптом:"
-    _log "$(ls -li "${_TARGET_DIR}/.ssh/authorized_keys" "${SUDOERS_FILE}" 2>/dev/null)"
+    _log "Список inode для проверки изменялись ли файлы скриптом при повторном запуске:"
+    _log "$(sudo ls -li "${_TARGET_DIR}/.ssh/authorized_keys" 2>/dev/null)"
+    _log "$(sudo ls -li "${SUDOERS_FILE}" 2>/dev/null)"
 
     _log "Готово! Пользователь ${_USER} настроен."
 }
@@ -213,11 +205,11 @@ fix_permissions_if_needed() {
     local target="$1"
     local expected_owner="$2"
     local expected_perms="$3"
-    
+
     if [ -e "${target}" ]; then
         local current_owner=$(sudo stat -c "%U:%G" "${target}" 2>/dev/null)
         local current_perms=$(sudo stat -c "%a" "${target}" 2>/dev/null)
-        
+
         if [ "${current_owner}" != "${expected_owner}" ] || [ "${current_perms}" != "${expected_perms}" ]; then
             _log "Исправляем права на '${target}'"
             sudo chown "${expected_owner}" "${target}"
@@ -228,7 +220,7 @@ fix_permissions_if_needed() {
 
 check_chage_param() {
     local param="$1"
-    local expected="$2"    
+    local expected="$2"
     sudo chage -l "$_USER" 2>/dev/null | grep -qE "^[[:space:]]*${param}[[:space:]]*:[[:space:]]*${expected}[[:space:]]*$"
 }
 
@@ -272,4 +264,3 @@ _error() {
 }
 
 main
-
