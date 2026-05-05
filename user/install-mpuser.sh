@@ -11,6 +11,8 @@
 # 8.  Создаются необходимые директория для файла ssh-ключа, назначаются права
 # 9.  Устанавливаются "обертки" системных утилит
 # 10. Для AstraLinux при необходимости назначается IntegrityLevel = 63
+# 11. При изменениях или ошибке отправляет в локальную почту root, если настроена пересылка - уйдет в почту админов
+#          https://git.net-07.local/leha/playbooks/-/blob/main/automation/localMail/set-send-local-mail-to-admins.sh?ref_type=heads
 #
 # Запустить на сервере:
 #    curl -sk https://git.net-07.local/leha/playbooks/-/raw/main/scripts/install-mpuser.sh?ref_type=heads | bash
@@ -28,37 +30,38 @@
 #
 # Ansible отчет:
 # echo "ip;host;OS;Ver OS;Edition;Count change;Info" > check.csv
-# grep fatal ansible.log | grep -o "\[10.*" | sed "s|]: |;|g" | sed "s|^\[||g" >> check.csv
-# cat ansible.log | grep -o "\[Result\].*" | sed 's|\\r\\n|\n|g' | grep -o "\[Result\].*" |  sed 's|\[Result\]: ||g' |  sort | uniq >> check.csv
-
+# cat ansible.log | grep -o "\[Result\].*" | sed 's|\\r\\n|\n|g' | grep -o "\[Result\].*" | sed 's|\[Result\]: ||g; s|"]}$||g; s|"}$||g' |  sort | uniq >> check.csv
 
 
 
 
 declare -r USER_TARGET="mpuser"
-AUTHORIZED_KEY='from="ansible-01.net-03.local,ansible-02.net-04.local" ssh-rsa AAAA ansible-admin'
+AUTHORIZED_KEY='from="ansible-01.net-03.local,ansible-02.net-04.local" ssh-rsa AAAA ansible-admins'
 declare -r VERSION_ARCHIVE="27.6.405"
 declare -r ARCHIVE="sudo_wrappers_static.tar"
-declare -r URL_ARCHIVE="https://git.net-07.local/leha/playbooks/-/raw/main/scripts/files/sudo_wrappers_static_${VERSION_ARCHIVE}.tar?ref_type=heads&inline=false"
-declare -r URL_KEY_PUB="https://git.net-07.local/leha/playbooks/-/raw/main/scripts/files/mp_ssh_key.pub?ref_type=heads&inline=false"
+declare -r URL_ARCHIVE="https://git.net-07.local/leha/playbooks/-/raw/main/scripts/files/mpuser/sudo_wrappers_static_${VERSION_ARCHIVE}.tar?ref_type=heads&inline=false"
+declare -r URL_KEY_PUB="https://git.net-07.local/leha/playbooks/-/raw/main/scripts/files/mpuser/mpuser_authorized_keys?ref_type=heads"
 declare -r TARGET_DIR="/home/${USER_TARGET}"
 declare -r TARGET_DIR_BIN="/mpx"
 
 
-
-export LANG="C"
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+export LANG="C.UTF-8" 2>/dev/null || export LC_ALL="C"
 export LC_ALL="${LANG}"
 _HOST="No set"
 count_change=0
 
+declare -r SCRIPT_NAME="${0##*/}"
+declare -r LOG_FILE="/var/log/automation/mpuser/${SCRIPT_NAME}.log"
+declare -r LOG_FILE_TMP=$(mktemp ~/${SCRIPT_NAME}.XXXXXX.log)
+
 set -euo pipefail
 
-main() {
-    #_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+main() {
     if [[ $EUID -eq 0 ]]; then
         _error "Запуск от root запрещен!"
-        exit 1
+        return 1
     fi
 
     _IP="$(hostname -I | awk '{print $1}')"
@@ -71,12 +74,25 @@ main() {
     }
     _HOST="$_IP;$_HN;$_ID;$_VER_ID;$_EDITION"
 
+    ASTRA_LINUX_MAX_IL=""
+    command -v pdp-id > /dev/null 2>&1 && [ -f /sys/module/parsec/parameters/max_ilev ] && {
+        ASTRA_LINUX_MAX_IL="$(cat /sys/module/parsec/parameters/max_ilev)"
+        _current_il="$(pdp-id -i)"
+        _log "AstraLinux max IntegrityLevel=${ASTRA_LINUX_MAX_IL}, пользователь '${USER}' имеет IL: ${_current_il}"
+
+        [ "${_current_il}" != "${ASTRA_LINUX_MAX_IL}" ] && {
+            _error "Пользователь '${USER}' не имеет максимального уровня целостности (IL). Установлен '${_current_il}', необходим '${ASTRA_LINUX_MAX_IL}'"
+            return 3
+        }
+    }
+    readonly ASTRA_LINUX_MAX_IL
+
     REINSTALL=false
 
-    [ $# -gt 1 ] && { _error "Неверное количество параметров. USE: ${0} [--reinstall]"; exit 1; }
+    [ $# -gt 1 ] && { _error "Неверное количество параметров. USE: ${0} [--reinstall]"; return 1; }
 
     [ $# -eq 1 ] && {
-        [ "$1" == "--reinstall" ] && REINSTALL=true || { _error "Неверный параметр '$1'. USE: $0 [--reinstall]"; exit 3; }
+        [ "$1" == "--reinstall" ] && REINSTALL=true || { _error "Неверный параметр '$1'. USE: $0 [--reinstall]"; return 3; }
     }
     readonly REINSTALL
 
@@ -91,25 +107,28 @@ main() {
 
     if [ -z "$AUTHORIZED_KEY" ]; then
         _error "SSH ключ не получен (пустое значение)"
-        exit 10
+        return 10
     fi
     if [ -n "$AUTHORIZED_KEY" ] && ! echo "$AUTHORIZED_KEY" | ssh-keygen -l -f - &>/dev/null; then
         _error "Невалидный SSH ключ: ${AUTHORIZED_KEY}"
-        exit 15
+        return 15
     fi
 
     if [ -z "${_ID}" ] || [ "${_ID}" = "unknown" ]; then
         _error "Не удалось определить ОС"
-        exit 20
+        return 20
     fi
     OS_ID="${_ID}"
 
     _log "Определена ОС: ${OS_ID}"
-    # Стандартизация OS_ID для путей в архиве
-    case "${OS_ID}" in
+    # Стандартизация OS_ID для путей в архиве ()
+    OS_ID_LOWER=$(echo "$OS_ID" | tr '[:upper:]' '[:lower:]')
+    case "${OS_ID_LOWER}" in
         "linuxmint")
-            OS_ID="ubuntu"
-            ;;
+            OS_ID="ubuntu" ;;
+        "centos"|"sintez")
+            OS_ID="rhel" ;;
+        *) ;;
     esac
     _log "Определена директория источник в архиве: ${OS_ID}"
 
@@ -119,7 +138,7 @@ main() {
         _log "    Загрузка архива с Git"
         declare -r _archive_tmp=$(mktemp "${ARCHIVE}.XXXXXX") || {
             _error "    Не удалось создать временный файл рядом с ${ARCHIVE}"
-            exit 23
+            return 23
         }
         _log "    Временный файл создан"
         # Удалить tmp при любом выходе (успех/ошибка/сигнал), если rename не успел переименовать
@@ -129,7 +148,7 @@ main() {
             _log "    Не удалось скачать архив с Git"
             [ ! -f "${ARCHIVE}" ] && {
                 _error "    Отсутствует локальный архив: ${ARCHIVE}"
-                exit 30
+                return 30
             }
         else
             mv -f "${_archive_tmp}" "${ARCHIVE}"
@@ -145,7 +164,7 @@ main() {
     _log "Проверка целостности архива (не битый ли файл)"
     if ! tar -tf "$ARCHIVE" >/dev/null 2>&1; then
         _error "Файл $ARCHIVE поврежден или не является архивом"
-        exit 40
+        return 40
     else
         _log "    Архив корректный"
     fi
@@ -153,14 +172,14 @@ main() {
     _log "Проверка в архиве наличия директории для ОС '${OS_ID}'"
     if ! tar -tf "$ARCHIVE" "sudo_wrappers_static/${OS_ID}/" >/dev/null 2>&1; then
         _error "В архиве отсутствует директория для ОС: ${OS_ID}"
-        exit 45
+        return 45
     else
         _log "    Директория определена"
     fi
 
     if ! command -v visudo &> /dev/null; then
        _error "Утилита 'visudo' не найдена. Для работы скрипта необходимо установить 'visudo'!"
-       exit 50
+       return 50
     fi
 
     # Экранируем ${USER_TARGET} для использования в расширенном regex.
@@ -195,37 +214,44 @@ main() {
     )
     # Показать "сторонние" файлы
     if [ -n "${_foreign_sudoers}" ]; then
-        _error "    Пользователь '${USER_TARGET}' найден в сторонних конфигах sudoers:"
-        _error "\n${_foreign_sudoers}"
-        _error "    Проверить вручную!"
-        exit 60
+        _log "[!] Пользователь '${USER_TARGET}' найден в сторонних конфигах sudoers:"
+        _log "    ${_foreign_sudoers}"
+        _error "    Пользователь '${USER_TARGET}' найден в сторонних конфигах sudoers. Проверить вручную!"
+        return 60
     fi
 
     #############################
     [ "${REINSTALL}" = true ] && id "${USER_TARGET}" >/dev/null 2>&1 && {
         if sudo userdel -r "${USER_TARGET}"; then
-            _log "Режим '--reinstall': пользователь '${USER_TARGET}' удален"
+            _log "[+] Режим '--reinstall': пользователь '${USER_TARGET}' удален"
             count_change=$((count_change + 1))
         else
             _error "Режим '--reinstall': не удалось удалить пользователя '${USER_TARGET}'"
-            exit 65
+            return 65
         fi
     }
-
-    ASTRA_LINUX_MAX_IL=""
-    command -v pdpl-user > /dev/null 2>&1 && [ -f /sys/module/parsec/parameters/max_ilev ] && {
-        ASTRA_LINUX_MAX_IL="$(cat /sys/module/parsec/parameters/max_ilev)"
-        _log "AstraLinux IntegrityLevel=${ASTRA_LINUX_MAX_IL}"
-    }
-    readonly ASTRA_LINUX_MAX_IL
 
     # Создание или обновление пользователя
     if id "${USER_TARGET}" >/dev/null 2>&1; then
         _log "Пользователь '${USER_TARGET}' уже существует"
     else
         sudo useradd -m "${USER_TARGET}"
-        _log "Создан новый пользователь '${USER_TARGET}'"
+        _log "[+] Создан новый пользователь '${USER_TARGET}'"
         count_change=$((count_change + 1))
+    fi
+
+    if ! getent group "${USER_TARGET}" >/dev/null 2>&1; then
+        _log "Создана группа ${USER_TARGET}"
+        sudo groupadd "${USER_TARGET}"
+    else
+        _log "Группа '${USER_TARGET}' уже существует"
+    fi
+
+    if ! id -Gn "${USER_TARGET}" | grep -qw "${USER_TARGET}"; then
+        _log "Пользователь '${USER_TARGET}' добавлен в группу '${USER_TARGET}'"
+        sudo usermod -g "${USER_TARGET}" "${USER_TARGET}"
+    else
+        _log "Пользователь '${USER_TARGET}' уже участник группы '${USER_TARGET}'"
     fi
 
     _log "Настройка параметров УЗ пользователя '${USER_TARGET}':"
@@ -234,7 +260,7 @@ main() {
     else
         # Заблокировать пользователя по паролю (исключая возможность разблокировки командами: 'passwd -l ...' и 'chmod -U ...')
         sudo usermod -p '*' "${USER_TARGET}"
-        _log "    Заблокирован пароль пользователя (в хеше пароля не было '*')"
+        _log "[+]  Заблокирован пароль пользователя (в хеше пароля не было '*')"
         count_change=$((count_change + 1))
     fi
 
@@ -243,7 +269,7 @@ main() {
        ! check_chage_param "Password expires" "never" || \
        ! check_chage_param "Account expires" "never"; then
         sudo chage -I -1 -m 0 -M 99999 -E -1 "${USER_TARGET}"
-        _log "    Политика пароля обновлена"
+        _log "[+] Политика пароля обновлена"
         count_change=$((count_change + 1))
     else
         _log "    Изменений не требуется: политика пароля корректна"
@@ -252,21 +278,22 @@ main() {
     _log "Проверка SSH ключа пользователя '${USER_TARGET}'..."
     # SSH ключи - обновляем только при несовпадении
     sudo mkdir -p "${TARGET_DIR}/.ssh"
-    # Получить отпечаток (fingerprints) ключа из скрипта
-    _NEW_KEY_FP=$(echo "${AUTHORIZED_KEY}" | ssh-keygen -l -f - | awk '{print $2}')
-    _EXISTING_KEY_FP=""
-    # Получить отпечаток (fingerprints) ключа из файла 'authorized_keys', если файл существует
+
+    _NEW_KEY_STR=$(echo "${AUTHORIZED_KEY}" | xargs)
+    # 2. Читаем существующий ключ (берем только первую строку, если их несколько)
+    _EXISTING_KEY_STR=""
     if sudo test -f "${TARGET_DIR}/.ssh/authorized_keys"; then
-        _EXISTING_KEY_FP=$(sudo ssh-keygen -l -f "${TARGET_DIR}/.ssh/authorized_keys" 2>/dev/null | awk '{print $2}')
+        # Читаем файл, убираем лишние пробелы
+        _EXISTING_KEY_STR=$(sudo cat "${TARGET_DIR}/.ssh/authorized_keys" | head -n 1 | xargs)
     fi
 
-    # Обновить ключ, если отпечатки SSH-ключей разные
-    if [ "${_NEW_KEY_FP}" != "${_EXISTING_KEY_FP}" ] || [ -z "${_EXISTING_KEY_FP}" ]; then
+    # 3. Сравниваем строки напрямую
+    if [ "${_NEW_KEY_STR}" != "${_EXISTING_KEY_STR}" ]; then
         echo "${AUTHORIZED_KEY}" | sudo tee "${TARGET_DIR}/.ssh/authorized_keys" > /dev/null
-        _log "    Обновлен SSH ключ для пользователя $USER_TARGET"
+        _log "[+] Обновлен SSH ключ (включая опции) для пользователя $USER_TARGET"
         count_change=$((count_change + 1))
     else
-        _log "    Изменений не требуется: SSH ключ актуальный (fingerprint: ${_NEW_KEY_FP})"
+        _log "    Изменений не требуется: SSH ключ и опции актуальны"
     fi
     fix_permissions_if_needed "${TARGET_DIR}/.ssh" "${USER_TARGET}:${USER_TARGET}" "700"
     fix_permissions_if_needed "${TARGET_DIR}/.ssh/authorized_keys" "${USER_TARGET}:${USER_TARGET}" "600"
@@ -295,7 +322,7 @@ main() {
     _log "    ${_TARGET_CHECKSUM} ? ${_ARCHIVE_CHECKSUM}"
     # Сравниваем хеши
     if [ "$_TARGET_CHECKSUM" != "$_ARCHIVE_CHECKSUM" ]; then
-        _log "    Хеши разные - обновляем файлы из архива..."
+        _log "[+] Хеши разные - обновляем файлы из архива..."
         # Удаляем локально файлы только из списка в архиве.
         # Есть риск "замусорить", если в архиве не будет директории, которая была в прошлой версии.
         # В начале скрипта проверка переменной TARGET_DIR на недопустимые значения, например пусто или '/'
@@ -313,7 +340,7 @@ main() {
         #command -v pdpl-file > /dev/null 2>&1 && [ -f /sys/module/parsec/parameters/max_ilev ] && \
         [ -n "${ASTRA_LINUX_MAX_IL}" ] && {
             sudo pdpl-file -R :"${ASTRA_LINUX_MAX_IL}" "${TARGET_DIR}"/bin/*
-            _log "AstraLinux установлен IL для файлов: ${ASTRA_LINUX_MAX_IL}"
+            _log "[+] AstraLinux установлен IL для файлов: ${ASTRA_LINUX_MAX_IL}"
             count_change=$((count_change + 1))
         }
     else
@@ -333,7 +360,6 @@ main() {
         NEW_HASH=$(sudo md5sum "${TARGET_DIR}/mpuser" | cut -d' ' -f1)
         CURRENT_HASH=$(sudo test -e "${SUDOERS_FILE}" && sudo md5sum "${SUDOERS_FILE}" | cut -d' ' -f1 || echo "none")
         if [ "${NEW_HASH}" != "${CURRENT_HASH}" ]; then
-            _log "    Обновляем sudoers (хеш: ${CURRENT_HASH} -> ${NEW_HASH})"
             sudo install -m 0440 -o root -g root "${TARGET_DIR}/mpuser" "${SUDOERS_FILE}"
             # Контрольная валидация
             if ! sudo visudo -cf "${SUDOERS_FILE}" &>/dev/null; then
@@ -341,6 +367,7 @@ main() {
                 sudo rm -f "${SUDOERS_FILE}"
                 exit 110
             fi
+            _log "[+] Обновляен sudoers (хеш: ${CURRENT_HASH} -> ${NEW_HASH})"
             count_change=$((count_change + 1))
         else
             _log "    Изменений не требуется: файл '${SUDOERS_FILE}' актуален"
@@ -348,7 +375,7 @@ main() {
         fix_permissions_if_needed "${SUDOERS_FILE}" "root:root" "440"
     else
         _error "    Некорректный синтаксис sudoers!"
-        exit 110
+        return 110
     fi
 
     # Astra Linux / PDP
@@ -358,17 +385,58 @@ main() {
                                                              "${ASTRA_LINUX_MAX_IL}" ] && {
             sudo pdpl-user -i "${ASTRA_LINUX_MAX_IL}" "${USER_TARGET}"
             sudo -u "${USER_TARGET}" pdp-id
-            _log "    Пользователю '${USER_TARGET}' установлен IL: ${ASTRA_LINUX_MAX_IL}"
+            _log "[+] Пользователю '${USER_TARGET}' установлен IL: ${ASTRA_LINUX_MAX_IL}"
             count_change=$((count_change + 1))
         } || _log "    Изменений не требуется"
     }
 
-    _log "Список inode для проверки изменялись ли файлы скриптом при повторном запуске:"
-    _log "    $(sudo ls -li "${TARGET_DIR}/.ssh/authorized_keys" 2>/dev/null)"
-    _log "    $(sudo ls -li "${SUDOERS_FILE}" 2>/dev/null)"
+    #_log "Список inode для проверки изменялись ли файлы скриптом при повторном запуске:"
+    #_log "    $(sudo ls -li "${TARGET_DIR}/.ssh/authorized_keys" 2>/dev/null)"
+    #_log "    $(sudo ls -li "${SUDOERS_FILE}" 2>/dev/null)"
 
     _log "Пользователь '${USER_TARGET}' настроен, изменений: ${count_change}"
+
+    if [ "${count_change}" -gt 0 ]; then
+        send_mail
+    fi
+
     _csv "OK"
+}
+
+send_mail() {
+    _msg_error="${1:-}"
+    # Определяем имя скрипта для текста письма
+    local -r _script_name=$(basename "$0")
+    local -r _body_file=$(mktemp)
+    if [ -n "${_msg_error}" ]; then
+        _subject="Script: ${_script_name} [Error]. ${_HOST}"
+        #_msg="${_HOST}\n\nScript ${_script_name} execution failed.\n\nError details: ${_msg_error}"
+        echo -e "${_HOST}\n\nScript ${_script_name} execution failed.\n\nError details: ${_msg_error}\n" > "$_body_file"
+    else
+        _subject="Script: ${_script_name} [Chg.: ${count_change}]. ${_HOST}"
+        #_msg="${_HOST}\n\nScript ${_script_name} executed successfully.\n\nChanges applied: ${count_change}"
+        echo -e "${_HOST}\n\nScript ${_script_name} executed successfully.\n\nChanges applied: ${count_change:-0}\n" > "$_body_file"
+    fi
+
+    [ -f "${LOG_FILE_TMP}" ] && _msg+="\n$(cat "${LOG_FILE_TMP}")"
+    if [ -f "${LOG_FILE_TMP}" ]; then
+        echo -e "--- LOG ---\n" >> "$_body_file"
+        cat "${LOG_FILE_TMP}" >> "$_body_file"
+    fi
+
+    # Проверка наличия команды mail
+    if command -v mail >/dev/null 2>&1; then
+        if mail -s "${_subject}" root < "$_body_file"; then
+            _log "Отчет отправлен пользователю 'root'"
+        else
+            _log "Ошибка: не удалось отправить почту через 'mail'"
+        fi
+#       {
+#            echo -e "${_msg}" | mail -s "${_subject}" root && _log "Отчет отправлен пользователю 'root' в локальную почту"
+#        } || _log "Неуспешная доставка локальной почты пользователю 'root'!"
+    else
+        _log "Утилита 'mail' не найдена. Уведомление не отправлено."
+    fi
 }
 
 # Проверяем и исправляем права на файлы
@@ -383,9 +451,9 @@ fix_permissions_if_needed() {
         local -r current_perms=$(sudo stat -c "%a" "${target}" 2>/dev/null)
 
         if [ "${current_owner}" != "${expected_owner}" ] || [ "${current_perms}" != "${expected_perms}" ]; then
-            sudo chown "${expected_owner}" "${target}"
-            sudo chmod "${expected_perms}" "${target}"
-            _log "    Права изменены (старые занчения: ${current_perms}, ${current_owner})"
+            sudo chown -R "${expected_owner}" "${target}"
+            sudo chmod -R "${expected_perms}" "${target}"
+            _log "[+] Права изменены (старые занчения: ${current_perms}, ${current_owner})"
             count_change=$((count_change + 1))
         else
             _log "    Изменений не требуется"
@@ -436,20 +504,34 @@ getDateTime() {
 
 _log() {
     local -r out="${1}"
-    printf "%s [INFO ]: %s\n" "$(getDateTime)" "${out}"
+    printf "%s [INFO ]: %s\n" "$(getDateTime)" "${out}" | tee -a "${LOG_FILE_TMP}"
 }
 
 _error() {
     local -r out="${1}"
-    printf "%s [ERROR]: %s\n" "$(getDateTime)" "${out}"
+    printf "%s [ERROR]: %s\n" "$(getDateTime)" "${out}" | tee -a "${LOG_FILE_TMP}"
+    count_change=-1
+    send_mail "${out}"
     _csv "${out}"
 }
 
 _csv()
 {
     local -r out="${1}"
-    printf "[Result]: %s\n" "${_HOST};$(getDateTime);${count_change};${out}"
+    printf "[Result]: %s\n" "${_HOST};$(getDateTime);${count_change};${out}" | tee -a "${LOG_FILE_TMP}"
 }
 
-main "$@"
+_append_to_log_file() {
+    if [ -f "${LOG_FILE_TMP}" ]; then
+        sudo mkdir -p "$(dirname "${LOG_FILE}")"
+        cat "${LOG_FILE_TMP}" | sudo tee -a "${LOG_FILE}" > /dev/null
 
+        rm -f "${LOG_FILE_TMP}"
+    fi
+}
+
+trap _append_to_log_file EXIT SIGTERM SIGINT
+
+main "$@"
+_return=$?
+exit ${_return}
