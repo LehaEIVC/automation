@@ -1,4 +1,4 @@
-#!/usr/bin/env sh
+#!/usr/bin/env bash
 
 # Скрипт создает пользователя mpuser:
 # 1.  При возможности скачивает ключ с Git, иначе берет из переменной в скрипте
@@ -17,6 +17,10 @@
 # Запустить на сервере:
 #    curl -sk https://git.net-07.local/leha/playbooks/-/raw/main/scripts/install-mpuser.sh?ref_type=heads | bash
 #
+# Запустить на сервере с переустановкой пользователя (пользователь удаляется со всем содержимым дом. директории,
+#             так же производится попытка загрузить архив с Git, локальный архив перезаписывается):
+#    curl -sk https://git.net-07.local/leha/playbooks/-/raw/main/scripts/install-mpuser.sh?ref_type=heads | bash -s -- --reinstall
+#
 # Запуск через Ansible:
 # - скачать плейбук: curl https://git.net-07.local/leha/playbooks/-/raw/main/ansible-run-script.yaml?ref_type=heads&inline=false -o ansible-run-script.yaml
 #     в ansible-run-script.yaml можно поменять параметр cmd для переустановки пользователя (с предварительным его удалением)
@@ -32,15 +36,13 @@
 
 
 declare -r USER_TARGET="mpuser"
-AUTHORIZED_KEY="ssh-rsa AAAA"
+AUTHORIZED_KEY='from="ansible-01.net-03.local,ansible-02.net-04.local" ssh-rsa AAAA ansible-admins'
 declare -r VERSION_ARCHIVE="27.6.405"
 declare -r ARCHIVE="sudo_wrappers_static.tar"
 declare -r URL_ARCHIVE="https://git.net-07.local/leha/playbooks/-/raw/main/scripts/files/mpuser/sudo_wrappers_static_${VERSION_ARCHIVE}.tar?ref_type=heads&inline=false"
 declare -r URL_KEY_PUB="https://git.net-07.local/leha/playbooks/-/raw/main/scripts/files/mpuser/mpuser_authorized_keys?ref_type=heads"
 declare -r TARGET_DIR="/home/${USER_TARGET}"
 declare -r TARGET_DIR_BIN="/mpx"
-
-
 
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
